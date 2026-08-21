@@ -1,0 +1,49 @@
+{
+  "project": "ACDI + Drift-Triage",
+  "person": "B",
+  "workspace": "person_b",
+  "repository": "ACDI-Drift-Triage",
+  "ownership": {
+    "person_b_scope": [
+      "drift_monitoring",
+      "drift_attack_injection",
+      "triage",
+      "defense",
+      "evaluation"
+    ],
+    "person_a_independent": true,
+    "integration_required_later": true
+  },
+  "data_policy": {
+    "drive_root": "Person-B Google Drive ACDI_Project",
+    "raw_data_in_git": false,
+    "processed_data_in_git": false,
+    "checkpoints_in_git": false,
+    "large_artifacts_in_git": false
+  },
+  "development_datasets": [
+    "CIC-IDS2017"
+  ],
+  "holdout_datasets": [
+    "CSE-CIC-IDS2018"
+  ],
+  "models": [
+    "XGBoost",
+    "Random Forest"
+  ],
+  "drift_monitors": [
+    "KS",
+    "Entropy",
+    "ADWIN",
+    "DDM",
+    "Page-Hinkley"
+  ],
+  "triage_actions": [
+    "NO_ACTION",
+    "MONITOR",
+    "RECALIBRATE",
+    "RETRAIN",
+    "FREEZE"
+  ],
+  "created_at_utc": "2026-08-21T19:49:24.272830+00:00"
+}

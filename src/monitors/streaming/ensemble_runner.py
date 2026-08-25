@@ -1,3 +1,4 @@
+
 from __future__ import annotations
 
 from src.monitors.streaming.adapter import (
@@ -15,6 +16,8 @@ from src.monitors.streaming.error_vote import (
     compute_error_drift_vote,
 )
 
+from src.windows.manager import WindowManager
+
 
 _ADWIN_NAME = "ADWIN"
 _DDM_NAME = "DDM"
@@ -27,26 +30,12 @@ class StreamingEnsembleRunner:
     while producing the canonical error consensus at external
     window level.
 
-    IMPORTANT ARCHITECTURAL BOUNDARY:
-
-    Detector adapters:
-        operate sample-by-sample.
-
-    ErrorDriftVoteResult:
-        represents one same-sample consensus input.
-
-    This runner:
-        accumulates whether each detector triggered AT LEAST
-        ONCE during the current external window, then at window
-        close creates synthetic, aligned DetectorUpdateResult
-        objects using the window's final sample index and calls
-        the existing compute_error_drift_vote() unchanged.
-
-    Existing detector contracts are not modified.
-
-    The runner NEVER automatically calls adapter.reset().
-    Detector lifecycle/reset semantics remain owned by the
-    individual adapters / future triage layer.
+    OPTIONAL WindowManager integration:
+        When window_manager is provided, every observation is
+        cross-validated against it BEFORE the existing
+        same-window lifecycle check. window_manager is optional
+        and fully backward-compatible: omitting it preserves the
+        exact prior behavior.
     """
 
     def __init__(
@@ -55,6 +44,7 @@ class StreamingEnsembleRunner:
         adwin_adapter: StreamingDetectorAdapter,
         ddm_adapter: StreamingDetectorAdapter,
         page_hinkley_adapter: StreamingDetectorAdapter,
+        window_manager: WindowManager | None = None,
     ) -> None:
         if not isinstance(run_id, str) or not run_id.strip():
             raise ValueError("run_id must be a non-empty string.")
@@ -77,11 +67,25 @@ class StreamingEnsembleRunner:
                 "the runner."
             )
 
+        if window_manager is not None:
+            if not isinstance(window_manager, WindowManager):
+                raise TypeError(
+                    "window_manager must be a WindowManager instance."
+                )
+
+            if window_manager.config.run_id != run_id:
+                raise ValueError(
+                    "window_manager.config.run_id must match "
+                    "runner.run_id."
+                )
+
         self._run_id = run_id
 
         self._adwin_adapter = adwin_adapter
         self._ddm_adapter = ddm_adapter
         self._page_hinkley_adapter = page_hinkley_adapter
+
+        self._window_manager = window_manager
 
         self._current_window_id: str | None = None
         self._last_sample_index: int | None = None
@@ -131,6 +135,41 @@ class StreamingEnsembleRunner:
     def page_hinkley_triggered(self) -> bool:
         return self._page_hinkley_triggered
 
+    def _validate_against_window_manager(
+        self,
+        observation: PredictionErrorObservation,
+    ) -> None:
+        """
+        Cross-check the observation against the external
+        WindowManager, if one was supplied.
+
+        WindowManager.window_for_index(sample_index) returns a
+        WindowBoundary and raises IndexError when sample_index is
+        out of range or falls inside a dropped partial window.
+        """
+
+        if self._window_manager is None:
+            return
+
+        try:
+            boundary = self._window_manager.window_for_index(
+                observation.sample_index
+            )
+        except IndexError as exc:
+            raise ValueError(
+                "sample_index is outside the WindowManager's "
+                f"valid range: {observation.sample_index!r}."
+            ) from exc
+
+        if boundary.window_id != observation.external_window_id:
+            raise ValueError(
+                "observation.external_window_id does not match "
+                "the WindowManager's expected window for "
+                f"sample_index={observation.sample_index!r}: "
+                f"expected {boundary.window_id!r}, got "
+                f"{observation.external_window_id!r}."
+            )
+
     def process_observation(
         self,
         observation: PredictionErrorObservation,
@@ -139,17 +178,6 @@ class StreamingEnsembleRunner:
         DetectorUpdateResult,
         DetectorUpdateResult,
     ]:
-        """
-        Feed one observation to all three adapters.
-
-        All three adapters receive the exact same observation.
-
-        The current external window is established by the first
-        observation. A window change requires the caller to close
-        the current window explicitly before processing the next
-        window.
-        """
-
         if not isinstance(observation, PredictionErrorObservation):
             raise TypeError(
                 "observation must be a PredictionErrorObservation."
@@ -159,6 +187,8 @@ class StreamingEnsembleRunner:
             raise ValueError(
                 "observation.run_id must match runner.run_id."
             )
+
+        self._validate_against_window_manager(observation)
 
         if self._current_window_id is None:
             self._current_window_id = observation.external_window_id
@@ -173,9 +203,6 @@ class StreamingEnsembleRunner:
         ddm_result = self._ddm_adapter.update(observation)
         page_hinkley_result = self._page_hinkley_adapter.update(observation)
 
-        # Window-level trigger accumulation:
-        # a detector is considered triggered for this window if
-        # it produced detection=True at ANY sample in the window.
         self._adwin_triggered = (
             self._adwin_triggered or adwin_result.detection
         )
@@ -193,18 +220,6 @@ class StreamingEnsembleRunner:
         return (adwin_result, ddm_result, page_hinkley_result)
 
     def close_window(self) -> ErrorDriftVoteResult:
-        """
-        Close the current external window and produce exactly one
-        canonical 2-of-3 consensus result.
-
-        The detector-level results created here are intentionally
-        synthetic window-level projections. They reuse the existing
-        DetectorUpdateResult contract so compute_error_drift_vote()
-        remains completely unchanged.
-
-        No detector.reset() is called here.
-        """
-
         if self._current_window_id is None:
             raise ValueError("No active external window to close.")
 
@@ -242,10 +257,6 @@ class StreamingEnsembleRunner:
             adwin_result, ddm_result, page_hinkley_result
         )
 
-        # Start a fresh window-level aggregation bucket.
-        #
-        # IMPORTANT:
-        # detector adapter lifecycle is NOT reset here.
         self._current_window_id = None
         self._last_sample_index = None
 
